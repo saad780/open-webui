@@ -215,11 +215,12 @@
 		const parentMessage = message.parentId ? history.messages[message.parentId] : null;
 		const promptTokens = estimateTokenCount(parentMessage?.content ?? '');
 		const completionTokens = estimateTokenCount(message.content ?? '');
+		const hadUsage = Boolean(message.usage);
 		const usage = {
 			...(message.usage ?? {}),
 			stopped: true,
 			partial: true,
-			estimated: true,
+			...(hadUsage ? {} : { estimated: true }),
 			prompt_tokens: message.usage?.prompt_tokens ?? promptTokens,
 			completion_tokens: message.usage?.completion_tokens ?? completionTokens,
 			total_tokens: message.usage?.total_tokens ?? promptTokens + completionTokens,
@@ -249,6 +250,38 @@
 			usage: message.usage
 		};
 		responseUsageStartedAt.delete(message.id);
+	};
+
+	const finalizeStoppedResponseMessages = async () => {
+		const responseMessage = history.currentId ? history.messages[history.currentId] : null;
+		if (!responseMessage || responseMessage.role !== 'assistant') {
+			return;
+		}
+
+		if (responseMessage.parentId && history.messages[responseMessage.parentId]) {
+			for (const messageId of history.messages[responseMessage.parentId].childrenIds) {
+				const message = history.messages[messageId];
+				if (message?.role === 'assistant') {
+					ensureStoppedUsage(message);
+					message.done = true;
+				}
+			}
+		} else {
+			ensureStoppedUsage(responseMessage);
+			responseMessage.done = true;
+		}
+
+		ensureStoppedUsage(responseMessage);
+		responseMessage.done = true;
+		history.messages[responseMessage.id] = responseMessage;
+
+		if ($chatId) {
+			await saveChatHandler($chatId, history);
+		}
+
+		if (autoScroll) {
+			scrollToBottom();
+		}
 	};
 
 	// Chat Input
@@ -2689,6 +2722,7 @@
 	};
 
 	const stopResponse = async (processQueue = true) => {
+		let stoppedGeneration = false;
 		if (taskIds) {
 			if ($chatId) {
 				await stopTasksByChatId(localStorage.token, $chatId).catch((error) => {
@@ -2705,31 +2739,18 @@
 			}
 
 			taskIds = null;
-
-			const responseMessage = history.messages[history.currentId];
-			// Set all response messages to done
-			if (responseMessage.parentId && history.messages[responseMessage.parentId]) {
-				for (const messageId of history.messages[responseMessage.parentId].childrenIds) {
-					ensureStoppedUsage(history.messages[messageId]);
-					history.messages[messageId].done = true;
-				}
-			}
-			ensureStoppedUsage(responseMessage);
-
-			history.messages[history.currentId] = responseMessage;
-			if ($chatId) {
-				await saveChatHandler($chatId, history);
-			}
-
-			if (autoScroll) {
-				scrollToBottom();
-			}
+			stoppedGeneration = true;
 		}
 
 		if (generating) {
 			generating = false;
 			generationController?.abort();
 			generationController = null;
+			stoppedGeneration = true;
+		}
+
+		if (stoppedGeneration) {
+			await finalizeStoppedResponseMessages();
 		}
 
 		if (processQueue) {
