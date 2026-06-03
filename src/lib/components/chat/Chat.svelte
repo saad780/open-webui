@@ -165,6 +165,7 @@
 	let generating = false;
 	let dragged = false;
 	let generationController = null;
+	let responseUsageStartedAt = new Map<string, number>();
 
 	let chat = null;
 	let tags = [];
@@ -177,6 +178,78 @@
 	};
 
 	let taskIds = null;
+
+	const contentToText = (content) => {
+		if (typeof content === 'string') {
+			return content;
+		}
+		if (Array.isArray(content)) {
+			return content
+				.map((part) => {
+					if (typeof part === 'string') {
+						return part;
+					}
+					if (part?.type === 'text' && typeof part?.text === 'string') {
+						return part.text;
+					}
+					return '';
+				})
+				.join(' ');
+		}
+		return '';
+	};
+
+	const estimateTokenCount = (content) => {
+		const text = removeAllDetails(contentToText(content)).trim();
+		if (!text) {
+			return 0;
+		}
+		return Math.max(1, Math.ceil(text.length / 4));
+	};
+
+	const buildStoppedUsage = (message) => {
+		const endedAt = Date.now();
+		const startedAt =
+			responseUsageStartedAt.get(message.id) ?? (message.timestamp ? message.timestamp * 1000 : endedAt);
+		const responseSeconds = Math.max((endedAt - startedAt) / 1000, 0);
+		const parentMessage = message.parentId ? history.messages[message.parentId] : null;
+		const promptTokens = estimateTokenCount(parentMessage?.content ?? '');
+		const completionTokens = estimateTokenCount(message.content ?? '');
+		const usage = {
+			...(message.usage ?? {}),
+			stopped: true,
+			partial: true,
+			estimated: true,
+			prompt_tokens: message.usage?.prompt_tokens ?? promptTokens,
+			completion_tokens: message.usage?.completion_tokens ?? completionTokens,
+			total_tokens: message.usage?.total_tokens ?? promptTokens + completionTokens,
+			response_seconds: message.usage?.response_seconds ?? Number(responseSeconds.toFixed(3))
+		};
+
+		if (completionTokens > 0 && responseSeconds > 0) {
+			const tokensPerSecond = Number((completionTokens / responseSeconds).toFixed(2));
+			usage.tokens_per_second = message.usage?.tokens_per_second ?? tokensPerSecond;
+			usage.completion_tokens_per_second =
+				message.usage?.completion_tokens_per_second ?? tokensPerSecond;
+			usage.end_to_end_tokens_per_second =
+				message.usage?.end_to_end_tokens_per_second ?? tokensPerSecond;
+		}
+
+		return usage;
+	};
+
+	const ensureStoppedUsage = (message) => {
+		if (!message || message.role !== 'assistant') {
+			return;
+		}
+
+		message.usage = buildStoppedUsage(message);
+		message.info = {
+			...(message.info ?? {}),
+			usage: message.usage
+		};
+		responseUsageStartedAt.delete(message.id);
+	};
 
 	// Chat Input
 	let prompt = '';
@@ -1855,12 +1928,17 @@
 
 		if (usage) {
 			message.usage = usage;
+			message.info = {
+				...(message.info ?? {}),
+				usage: message.usage
+			};
 		}
 
 		history.messages[message.id] = message;
 
 		if (done) {
 			message.done = true;
+			responseUsageStartedAt.delete(message.id);
 
 			if ($settings.responseAutoCopy) {
 				copyToClipboard(message.content);
@@ -2118,6 +2196,7 @@
 					modelIdx: modelIdx ? modelIdx : _modelIdx,
 					timestamp: Math.floor(Date.now() / 1000) // Unix epoch
 				};
+				responseUsageStartedAt.set(responseMessageId, Date.now());
 
 				// Add message to history and Set currentId to messageId
 				history.messages[responseMessageId] = responseMessage;
@@ -2273,6 +2352,9 @@
 		} = {}
 	) => {
 		const responseMessage = _history.messages[responseMessageId];
+		if (!responseUsageStartedAt.has(responseMessageId)) {
+			responseUsageStartedAt.set(responseMessageId, Date.now());
+		}
 		const userMessage = _history.messages[responseMessage.parentId];
 
 		const chatMessageFiles = _messages
@@ -2628,11 +2710,16 @@
 			// Set all response messages to done
 			if (responseMessage.parentId && history.messages[responseMessage.parentId]) {
 				for (const messageId of history.messages[responseMessage.parentId].childrenIds) {
+					ensureStoppedUsage(history.messages[messageId]);
 					history.messages[messageId].done = true;
 				}
 			}
+			ensureStoppedUsage(responseMessage);
 
 			history.messages[history.currentId] = responseMessage;
+			if ($chatId) {
+				await saveChatHandler($chatId, history);
+			}
 
 			if (autoScroll) {
 				scrollToBottom();
