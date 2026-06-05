@@ -5,6 +5,7 @@
 
 	import XMark from '$lib/components/icons/XMark.svelte';
 	import AdvancedParams from '../Settings/Advanced/AdvancedParams.svelte';
+	import ThinkingEffortMenu from '../MessageInput/ThinkingEffortMenu.svelte';
 	import Valves from '$lib/components/chat/Controls/Valves.svelte';
 	import FileItem from '$lib/components/common/FileItem.svelte';
 	import Collapsible from '$lib/components/common/Collapsible.svelte';
@@ -122,6 +123,10 @@
 			{/if}
 
 			{#if $user?.role === 'admin' || ($user?.permissions.chat?.params ?? true)}
+				<ThinkingEffortMenu {models} bind:params />
+
+				<hr class="my-2 border-gray-50 dark:border-gray-700/10" />
+
 				<Collapsible
 					title={$i18n.t('Advanced Params')}
 					bind:open={showAdvancedParams}
