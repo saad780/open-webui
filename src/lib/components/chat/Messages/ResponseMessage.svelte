@@ -136,6 +136,91 @@
 		}
 	}
 
+	const usageMetricOrder = [
+		'total_tokens',
+		'prompt_tokens',
+		'completion_tokens',
+		'ttft_seconds',
+		'prefill_tokens_per_second',
+		'tokens_per_second',
+		'prompt_tokens_per_second',
+		'completion_tokens_per_second',
+		'response_seconds',
+		'generation_seconds',
+		'server_response_seconds',
+		'end_to_end_tokens_per_second',
+		'prompt_eval_count',
+		'prompt_eval_duration',
+		'eval_count',
+		'eval_duration',
+		'draft_tokens',
+		'draft_tokens_accepted',
+		'cached_prompt_tokens'
+	];
+
+	const usageMetricLabels: Record<string, string> = {
+		total_tokens: 'total tokens',
+		prompt_tokens: 'prompt tokens',
+		completion_tokens: 'completion tokens',
+		ttft_seconds: 'TTFT seconds',
+		prefill_tokens_per_second: 'prefill TPS',
+		prompt_tokens_per_second: 'prompt TPS',
+		tokens_per_second: 'TPS',
+		completion_tokens_per_second: 'completion TPS',
+		response_seconds: 'response seconds',
+		generation_seconds: 'generation seconds',
+		server_response_seconds: 'server response seconds',
+		end_to_end_tokens_per_second: 'end-to-end TPS',
+		prompt_eval_count: 'prompt eval count',
+		prompt_eval_duration: 'prompt eval duration',
+		eval_count: 'eval count',
+		eval_duration: 'eval duration',
+		draft_tokens: 'draft tokens',
+		draft_tokens_accepted: 'draft tokens accepted',
+		cached_prompt_tokens: 'cached prompt tokens'
+	};
+
+	const formatUsageValue = (value: unknown) => {
+		if (typeof value === 'number') {
+			return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(3)));
+		}
+		if (typeof value === 'string') {
+			return value;
+		}
+		if (typeof value === 'boolean') {
+			return value ? 'true' : 'false';
+		}
+		if (value === null) {
+			return 'null';
+		}
+		return JSON.stringify(value);
+	};
+
+	const formatUsageTooltip = (usage: unknown) => {
+		if (!usage || typeof usage !== 'object' || Array.isArray(usage)) {
+			return String(usage ?? '');
+		}
+
+		const usageRecord = usage as Record<string, unknown>;
+		const displayed = new Set<string>();
+		const lines: string[] = [];
+
+		for (const key of usageMetricOrder) {
+			if (usageRecord[key] !== undefined) {
+				displayed.add(key);
+				lines.push(`${usageMetricLabels[key] ?? key}: ${formatUsageValue(usageRecord[key])}`);
+			}
+		}
+
+		for (const [key, value] of Object.entries(usageRecord)) {
+			if (!displayed.has(key)) {
+				lines.push(`${key}: ${formatUsageValue(value)}`);
+			}
+		}
+
+		return lines.join('\n');
+	};
+
 	export let siblings;
 
 	export let setInputText: Function = () => {};
@@ -1146,13 +1231,7 @@
 									<Tooltip
 										content={message.usage
 											? `<pre>${sanitizeResponseContent(
-													JSON.stringify(message.usage, null, 2)
-														.replace(/"([^(")"]+)":/g, '$1:')
-														.slice(1, -1)
-														.split('\n')
-														.map((line) => line.slice(2))
-														.map((line) => (line.endsWith(',') ? line.slice(0, -1) : line))
-														.join('\n')
+													formatUsageTooltip(message.usage)
 												)}</pre>`
 											: ''}
 										placement="bottom"
