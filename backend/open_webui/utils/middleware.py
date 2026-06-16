@@ -2308,6 +2308,28 @@ async def connect_mcp_server(
     return client, tool_specs
 
 
+def merge_model_tool_ids(tool_ids, model) -> list[str] | None:
+    """Append model-attached tools to request tool IDs without duplicates."""
+    merged: list[str] = []
+    seen: set[str] = set()
+
+    for raw_tool_id in tool_ids or []:
+        tool_id = str(raw_tool_id)
+        if tool_id and tool_id not in seen:
+            seen.add(tool_id)
+            merged.append(tool_id)
+
+    model_tool_ids = model.get('info', {}).get('meta', {}).get('toolIds', [])
+    if isinstance(model_tool_ids, list):
+        for raw_tool_id in model_tool_ids:
+            tool_id = str(raw_tool_id)
+            if tool_id and tool_id not in seen:
+                seen.add(tool_id)
+                merged.append(tool_id)
+
+    return merged or None
+
+
 async def process_chat_payload(request, form_data, user, metadata, model):
     # Ensure chat_id is always a string — external API clients may omit it.
     if not isinstance(metadata.get('chat_id'), str):
@@ -2610,7 +2632,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                         append=True,
                     )
 
-    tool_ids = form_data.pop('tool_ids', None)
+    tool_ids = merge_model_tool_ids(form_data.pop('tool_ids', None), model)
     terminal_id = form_data.pop('terminal_id', None)
     files = form_data.pop('files', None)
     form_data.pop('folder_id', None)
