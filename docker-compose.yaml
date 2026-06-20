@@ -16,6 +16,8 @@ services:
     container_name: open-webui
     volumes:
       - open-webui:/app/backend/data
+      - ${OPEN_WEBUI_HOST_HOME-/home/spark}:/mnt/host-home:ro
+      - ${OPEN_WEBUI_LOCAL_FILES-/home/spark/openwebui-files}:/mnt/local-files:rw
     depends_on:
       - ollama
     ports:
