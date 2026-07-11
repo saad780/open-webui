@@ -1,120 +1,61 @@
 <script lang="ts">
 	import { getContext } from 'svelte';
+	import type { Readable } from 'svelte/store';
 
-	import Dropdown from '$lib/components/common/Dropdown.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import Sparkles from '$lib/components/icons/Sparkles.svelte';
+	import {
+		normalizeThinkingEffort,
+		thinkingIsEnabled,
+		toggledThinkingEffort
+	} from './thinking-effort';
 
-	type ThinkingLevel = {
-		id: string;
-		label?: string;
-		thinkingBudgetTokens?: number;
-		maxTokens?: number;
+	type I18n = { t: (key: string, ...args: unknown[]) => string };
+	type ThinkingModel = {
+		info?: {
+			meta?: {
+				capabilities?: Record<string, unknown>;
+				local_llm?: { thinking?: { default?: unknown } };
+			};
+		};
 	};
 
-	const i18n = getContext<any>('i18n');
+	const i18n = getContext<Readable<I18n>>('i18n');
 
-	export let models: any[] = [];
-	export let params: Record<string, any> = {};
-
-	const preferredOrder = ['off', 'light', 'moderate', 'heavy'];
-	const fallbackLevels: ThinkingLevel[] = [
-		{ id: 'off', label: 'Off' },
-		{ id: 'light', label: 'Light' },
-		{ id: 'moderate', label: 'Moderate' },
-		{ id: 'heavy', label: 'Heavy' }
-	];
-
-	let show = false;
-
-	const normalizeEffort = (value: unknown): string | null => {
-		if (typeof value !== 'string') {
-			return null;
-		}
-		const normalized = value.trim().toLowerCase();
-		if (normalized === 'low') return 'light';
-		if (normalized === 'medium') return 'moderate';
-		if (normalized === 'high') return 'heavy';
-		return normalized || null;
-	};
-
-	const displayLabel = (option?: ThinkingLevel | null): string => {
-		if (!option) return $i18n.t('Moderate');
-		if (option.id === 'off') return $i18n.t('Off');
-		if (option.id === 'light') return $i18n.t('Light');
-		if (option.id === 'moderate') return $i18n.t('Moderate');
-		if (option.id === 'heavy') return $i18n.t('Heavy');
-		return option.label ?? option.id;
-	};
-
-	const displayDescription = (id: string): string => {
-		if (id === 'off') return $i18n.t('Disable model thinking for this response');
-		if (id === 'light') return $i18n.t('Use a short thinking budget');
-		if (id === 'moderate') return $i18n.t('Use the default thinking budget');
-		if (id === 'heavy') return $i18n.t('Use a larger thinking budget');
-		return '';
-	};
+	export let models: ThinkingModel[] = [];
+	export let params: Record<string, unknown> = {};
 
 	$: selectedModel = models.length === 1 ? models[0] : null;
-	$: selectedModelMeta = (selectedModel?.info?.meta ?? {}) as Record<string, any>;
+	$: selectedModelMeta = selectedModel?.info?.meta ?? {};
+	$: capabilities = selectedModelMeta?.capabilities ?? {};
 	$: thinkingMeta = selectedModelMeta?.local_llm?.thinking ?? null;
-	$: capabilities = (selectedModelMeta?.capabilities ?? {}) as Record<string, any>;
 	$: thinkingCapable = models.length === 1 && capabilities?.['reasoning_effort'] === true;
-	$: rawLevels =
-		thinkingCapable && Array.isArray(thinkingMeta?.levels) && thinkingMeta.levels.length > 0
-			? (thinkingMeta.levels as ThinkingLevel[])
-			: fallbackLevels;
-	$: availableLevels = preferredOrder
-		.map((id) => rawLevels.find((level) => level?.id === id))
-		.filter((level): level is ThinkingLevel => Boolean(level));
-	$: defaultEffort = normalizeEffort(thinkingMeta?.default) ?? 'moderate';
-	$: currentEffort = normalizeEffort(params?.reasoning_effort) ?? defaultEffort;
-	$: selectedOption =
-		availableLevels.find((level) => level?.id === currentEffort) ??
-		availableLevels.find((level) => level?.id === defaultEffort) ??
-		availableLevels[0];
+	$: defaultEffort = normalizeThinkingEffort(thinkingMeta?.default) ?? 'off';
+	$: enabled = thinkingIsEnabled(params?.reasoning_effort, defaultEffort);
 
-	const setEffort = (effort: string) => {
-		params = { ...params, reasoning_effort: effort };
-		show = false;
+	const toggleThinking = () => {
+		params = { ...params, reasoning_effort: toggledThinkingEffort(enabled) };
 	};
 </script>
 
 {#if thinkingCapable}
-	<Dropdown
-		bind:show
-		side="top"
-		align="start"
-		contentClass="w-48 rounded-xl border border-gray-100 dark:border-gray-800 bg-white dark:bg-gray-950 shadow-lg p-1"
+	<Tooltip
+		content={enabled
+			? $i18n.t('Disable model thinking for upcoming responses')
+			: $i18n.t('Enable model thinking for upcoming responses')}
+		placement="top"
 	>
-		<Tooltip content={$i18n.t('Thinking effort')} placement="top">
-			<button
-				type="button"
-				class="bg-transparent hover:bg-gray-100 text-gray-700 dark:text-white dark:hover:bg-gray-800 rounded-full h-8 px-2.5 flex gap-1.5 justify-center items-center outline-hidden focus:outline-hidden"
-				aria-label={$i18n.t('Thinking effort')}
-			>
-				<Sparkles className="size-4" strokeWidth="1.75" />
-				<span class="text-xs font-medium max-w-20 truncate">{displayLabel(selectedOption)}</span>
-			</button>
-		</Tooltip>
-
-		<div slot="content" class="flex flex-col">
-			{#each availableLevels as option}
-				<Tooltip content={displayDescription(option.id)} placement="left">
-					<button
-						type="button"
-						class="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-sm hover:bg-gray-50 dark:hover:bg-gray-800/60"
-						on:click={() => setEffort(option.id)}
-					>
-						<span
-							class="size-1.5 rounded-full shrink-0 {option.id === selectedOption?.id
-								? 'bg-gray-900 dark:bg-gray-100'
-								: 'bg-transparent'}"
-						></span>
-						<span class="flex-1 truncate">{displayLabel(option)}</span>
-					</button>
-				</Tooltip>
-			{/each}
-		</div>
-	</Dropdown>
+		<button
+			type="button"
+			class="h-8 px-2.5 flex gap-1.5 justify-center items-center rounded-full outline-hidden focus:outline-hidden transition-colors {enabled
+				? 'text-sky-500 dark:text-sky-300 bg-sky-50 hover:bg-sky-100 dark:bg-sky-400/10 dark:hover:bg-sky-600/10 border border-sky-200/40 dark:border-sky-500/20'
+				: 'bg-transparent hover:bg-gray-100 text-gray-700 dark:text-white dark:hover:bg-gray-800'}"
+			aria-label={enabled ? $i18n.t('Thinking on') : $i18n.t('Thinking off')}
+			aria-pressed={enabled}
+			on:click={toggleThinking}
+		>
+			<Sparkles className="size-4" strokeWidth="1.75" />
+			<span class="text-xs font-medium">{$i18n.t('Thinking')}</span>
+		</button>
+	</Tooltip>
 {/if}
