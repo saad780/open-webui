@@ -87,6 +87,10 @@
 			query?: string;
 		};
 		done: boolean;
+		finish_reason?: string | null;
+		auto_continuations?: number;
+		partial?: boolean;
+		partial_reason?: 'output_limit' | 'tool_call_truncated' | 'provider_error' | null;
 		error?: boolean | { content: string };
 		sources?: string[];
 		code_executions?: {
@@ -975,6 +979,25 @@
 					</div>
 				</div>
 
+				{#if message?.done && message?.partial}
+					<div
+						class="mt-2 rounded-md border border-amber-300/70 bg-amber-50 px-2.5 py-1.5 text-xs text-amber-900 dark:border-amber-700/70 dark:bg-amber-950/40 dark:text-amber-100"
+						role="status"
+					>
+						{#if message?.partial_reason === 'tool_call_truncated'}
+							{$i18n.t(
+								'The response ended during a tool call and may be incomplete. Please retry.'
+							)}
+						{:else if message?.partial_reason === 'provider_error'}
+							{$i18n.t('Automatic continuation failed. The response may be incomplete.')}
+						{:else}
+							{$i18n.t(
+								'The response reached the automatic continuation limit and may be incomplete. Use Continue Response to keep going.'
+							)}
+						{/if}
+					</div>
+				{/if}
+
 				{#if !edit}
 					<div
 						bind:this={buttonsContainerElement}
@@ -1230,9 +1253,7 @@
 								{#if message.usage}
 									<Tooltip
 										content={message.usage
-											? `<pre>${sanitizeResponseContent(
-													formatUsageTooltip(message.usage)
-												)}</pre>`
+											? `<pre>${sanitizeResponseContent(formatUsageTooltip(message.usage))}</pre>`
 											: ''}
 										placement="bottom"
 									>

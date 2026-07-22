@@ -27,7 +27,7 @@ from open_webui.utils.plugin import (
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
 
-DYNAMIC_BASE_META_KEYS = ('local_llm',)
+DYNAMIC_BASE_META_KEYS = ('local_llm', 'auto_continue_max_retries')
 DYNAMIC_BASE_CAPABILITY_KEYS = {
     'vision',
     'file_upload',
@@ -37,6 +37,7 @@ DYNAMIC_BASE_CAPABILITY_KEYS = {
     'usage',
     'citations',
     'status_updates',
+    'auto_continue_on_length',
 }
 
 

@@ -210,7 +210,8 @@
 	const buildStoppedUsage = (message) => {
 		const endedAt = Date.now();
 		const startedAt =
-			responseUsageStartedAt.get(message.id) ?? (message.timestamp ? message.timestamp * 1000 : endedAt);
+			responseUsageStartedAt.get(message.id) ??
+			(message.timestamp ? message.timestamp * 1000 : endedAt);
 		const responseSeconds = Math.max((endedAt - startedAt) / 1000, 0);
 		const parentMessage = message.parentId ? history.messages[message.parentId] : null;
 		const promptTokens = estimateTokenCount(parentMessage?.content ?? '');
@@ -1861,7 +1862,21 @@
 	};
 
 	const chatCompletionEventHandler = async (data, message, chatId) => {
-		const { id, done, choices, content, output, sources, selected_model_id, error, usage } = data;
+		const {
+			id,
+			done,
+			choices,
+			content,
+			output,
+			sources,
+			selected_model_id,
+			error,
+			usage,
+			finish_reason,
+			auto_continuations,
+			partial,
+			partial_reason
+		} = data;
 
 		// Store raw OR-aligned output items from backend
 		if (output) {
@@ -1965,6 +1980,19 @@
 				...(message.info ?? {}),
 				usage: message.usage
 			};
+		}
+
+		if (finish_reason !== undefined) {
+			message.finish_reason = finish_reason;
+		}
+		if (auto_continuations !== undefined) {
+			message.auto_continuations = auto_continuations;
+		}
+		if (partial !== undefined) {
+			message.partial = partial;
+		}
+		if (partial_reason !== undefined) {
+			message.partial_reason = partial_reason;
 		}
 
 		history.messages[message.id] = message;

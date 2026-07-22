@@ -1991,10 +1991,16 @@ async def chat_completion(
                     # Save each assistant placeholder
                     for target_model_id, assistant_message_id in message_ids.items():
                         if assistant_message_id:
-                            await Chats.upsert_message_to_chat_by_id_and_message_id(
-                                chat_id,
-                                assistant_message_id,
+                            is_continuation = metadata.get('assistant_message_id') == assistant_message_id
+                            placeholder = (
                                 {
+                                    'done': False,
+                                    'finish_reason': None,
+                                    'partial': False,
+                                    'partial_reason': None,
+                                }
+                                if is_continuation
+                                else {
                                     'id': assistant_message_id,
                                     'parentId': user_message_id,
                                     'childrenIds': [],
@@ -2003,7 +2009,12 @@ async def chat_completion(
                                     'done': False,
                                     'model': target_model_id,
                                     'timestamp': int(time.time()),
-                                },
+                                }
+                            )
+                            await Chats.upsert_message_to_chat_by_id_and_message_id(
+                                chat_id,
+                                assistant_message_id,
+                                placeholder,
                             )
 
         request.state.metadata = metadata
