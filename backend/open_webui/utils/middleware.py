@@ -112,6 +112,7 @@ from open_webui.utils.payload import apply_system_prompt_to_body
 from open_webui.utils.plugin import load_function_module_by_id
 from open_webui.utils.response import normalize_usage
 from open_webui.utils.sanitize import sanitize_code
+from open_webui.utils.skill_selection import resolve_skill_ids
 from open_webui.utils.task import (
     get_task_model_id,
     rag_template,
@@ -147,11 +148,35 @@ DEFAULT_REASONING_TAGS = [
 ]
 DEFAULT_SOLUTION_TAGS = [('<|begin_of_solution|>', '<|end_of_solution|>')]
 DEFAULT_CODE_INTERPRETER_TAGS = [('<code_interpreter>', '</code_interpreter>')]
+DEFAULT_AUTO_CONTINUE_MAX_RETRIES = 2
 
 
 def output_id(prefix: str) -> str:
     """Generate OR-style ID: prefix + 24-char hex UUID."""
     return f'{prefix}_{uuid4().hex[:24]}'
+
+
+def auto_continue_config(model: dict) -> tuple[bool, int]:
+    """Return model-scoped output-limit continuation settings."""
+    meta = model.get('info', {}).get('meta', {}) if isinstance(model, dict) else {}
+    capabilities = meta.get('capabilities') or {}
+    enabled = capabilities.get('auto_continue_on_length') is True
+    try:
+        retries = int(meta.get('auto_continue_max_retries', DEFAULT_AUTO_CONTINUE_MAX_RETRIES))
+    except (TypeError, ValueError):
+        retries = DEFAULT_AUTO_CONTINUE_MAX_RETRIES
+    return enabled, max(0, min(retries, DEFAULT_AUTO_CONTINUE_MAX_RETRIES))
+
+
+def continuation_messages(base_messages: list[dict], output: list, reasoning_format: str | None = None) -> list[dict]:
+    """Build one assistant-prefill request without duplicating a prior assistant tail."""
+    messages = [copy.deepcopy(message) for message in base_messages]
+    while messages and messages[-1].get('role') == 'assistant':
+        messages.pop()
+    return [
+        *messages,
+        *convert_output_to_messages(output, raw=True, reasoning_format=reasoning_format),
+    ]
 
 
 def _split_tool_calls(
@@ -2308,6 +2333,28 @@ async def connect_mcp_server(
     return client, tool_specs
 
 
+def merge_model_tool_ids(tool_ids, model) -> list[str] | None:
+    """Append model-attached tools to request tool IDs without duplicates."""
+    merged: list[str] = []
+    seen: set[str] = set()
+
+    for raw_tool_id in tool_ids or []:
+        tool_id = str(raw_tool_id)
+        if tool_id and tool_id not in seen:
+            seen.add(tool_id)
+            merged.append(tool_id)
+
+    model_tool_ids = model.get('info', {}).get('meta', {}).get('toolIds', [])
+    if isinstance(model_tool_ids, list):
+        for raw_tool_id in model_tool_ids:
+            tool_id = str(raw_tool_id)
+            if tool_id and tool_id not in seen:
+                seen.add(tool_id)
+                merged.append(tool_id)
+
+    return merged or None
+
+
 async def process_chat_payload(request, form_data, user, metadata, model):
     # Ensure chat_id is always a string — external API clients may omit it.
     if not isinstance(metadata.get('chat_id'), str):
@@ -2369,6 +2416,8 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                     db_messages.append(
                         {k: v for k, v in assistant_message.items() if k in ('role', 'content', 'output', 'files')}
                     )
+                    form_data['continue_final_message'] = True
+                    form_data['add_generation_prompt'] = False
 
             system_message = get_system_message(form_data.get('messages', []))
             form_data['messages'] = [system_message, *db_messages] if system_message else db_messages
@@ -2610,7 +2659,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                         append=True,
                     )
 
-    tool_ids = form_data.pop('tool_ids', None)
+    tool_ids = merge_model_tool_ids(form_data.pop('tool_ids', None), model)
     terminal_id = form_data.pop('terminal_id', None)
     files = form_data.pop('files', None)
     form_data.pop('folder_id', None)
@@ -2621,11 +2670,14 @@ async def process_chat_payload(request, form_data, user, metadata, model):
 
     # Skills — extract IDs from message content (<$skillId|label> tags) so
     # persisted chats work without relying on the frontend to send skill_ids.
-    user_skill_ids = set(form_data.pop('skill_ids', None) or [])
-    user_skill_ids |= extract_skill_ids_from_messages(form_data.get('messages', []))
+    submitted_skill_ids = set(form_data.pop('skill_ids', None) or [])
+    mentioned_skill_ids = extract_skill_ids_from_messages(form_data.get('messages', []))
     model_skill_ids = set(model.get('info', {}).get('meta', {}).get('skillIds', []))
-
-    all_skill_ids = user_skill_ids | model_skill_ids
+    user_skill_ids, all_skill_ids = resolve_skill_ids(
+        submitted_skill_ids,
+        model_skill_ids,
+        mentioned_skill_ids,
+    )
     available_skills = []
     if all_skill_ids:
         from open_webui.models.skills import Skills as SkillsModel
@@ -3425,6 +3477,8 @@ async def non_streaming_chat_response_handler(response, ctx):
     request = ctx['request']
 
     user = ctx['user']
+    model = ctx['model']
+    form_data = ctx['form_data']
     metadata = ctx['metadata']
     events = ctx['events']
 
@@ -3472,8 +3526,89 @@ async def non_streaming_chat_response_handler(response, ctx):
                 )
 
             choices = response_data.get('choices', [])
-            if choices and choices[0].get('message', {}).get('content'):
-                content = response_data['choices'][0]['message']['content']
+            auto_continue_enabled, auto_continue_max_retries = auto_continue_config(model)
+            auto_continuations = 0
+            continuation_error = None
+            finish_reason = choices[0].get('finish_reason') if choices else None
+            initial_content = choices[0].get('message', {}).get('content', '') if choices else ''
+            prior_assistant_content = (
+                get_last_assistant_message(form_data.get('messages', []))
+                if form_data.get('continue_final_message')
+                else ''
+            )
+            combined_content = f'{prior_assistant_content or ""}{initial_content or ""}'
+
+            while (
+                auto_continue_enabled
+                and finish_reason == 'length'
+                and combined_content
+                and auto_continuations < auto_continue_max_retries
+                and not choices[0].get('message', {}).get('tool_calls')
+            ):
+                auto_continuations += 1
+                continuation_output = [
+                    {
+                        'type': 'message',
+                        'role': 'assistant',
+                        'content': [{'type': 'output_text', 'text': combined_content}],
+                    }
+                ]
+                continuation_form_data = {
+                    **form_data,
+                    'stream': False,
+                    'messages': continuation_messages(
+                        form_data.get('messages', []),
+                        continuation_output,
+                        reasoning_format=get_reasoning_format(model),
+                    ),
+                    'continue_final_message': True,
+                    'add_generation_prompt': False,
+                }
+                try:
+                    continuation_response = await generate_chat_completion(
+                        request,
+                        continuation_form_data,
+                        user,
+                        bypass_system_prompt=True,
+                    )
+                    _, continuation_data = get_response_data(continuation_response)
+                    if not isinstance(continuation_data, dict) or continuation_data.get('error'):
+                        continuation_error = (continuation_data or {}).get('error', 'Invalid continuation response')
+                        break
+                    continuation_choices = continuation_data.get('choices', [])
+                    if not continuation_choices:
+                        continuation_error = 'Continuation response did not contain a choice.'
+                        break
+                    continuation_choice = continuation_choices[0]
+                    combined_content += continuation_choice.get('message', {}).get('content', '') or ''
+                    finish_reason = continuation_choice.get('finish_reason')
+                    choices = continuation_choices
+                    if continuation_data.get('usage'):
+                        response_data['usage'] = continuation_data['usage']
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    raise
+                except Exception as exc:
+                    continuation_error = str(exc)
+                    log.warning('Automatic non-streaming response continuation failed: %s', exc)
+                    break
+
+            response_choices = response_data.get('choices') or []
+            if response_choices and isinstance(response_choices[0], dict):
+                response_message = response_choices[0].setdefault('message', {})
+                if isinstance(response_message, dict):
+                    response_message['content'] = combined_content
+                response_choices[0]['finish_reason'] = finish_reason
+
+            partial = finish_reason == 'length' or bool(continuation_error)
+            completion_metadata = {
+                'finish_reason': finish_reason,
+                'auto_continuations': auto_continuations,
+                'partial': partial,
+                'partial_reason': 'provider_error' if continuation_error else ('output_limit' if partial else None),
+            }
+
+            if combined_content:
+                content = combined_content
 
                 if content:
                     await event_emitter(
@@ -3511,6 +3646,7 @@ async def non_streaming_chat_response_handler(response, ctx):
                                 'content': content,
                                 'output': response_output,
                                 'title': title,
+                                **completion_metadata,
                             },
                         }
                     )
@@ -3527,6 +3663,7 @@ async def non_streaming_chat_response_handler(response, ctx):
                                 'role': 'assistant',
                                 'content': content,
                                 'output': response_output,
+                                **completion_metadata,
                                 **({'usage': usage} if usage else {}),
                             },
                         )
@@ -3550,6 +3687,7 @@ async def non_streaming_chat_response_handler(response, ctx):
                     ctx['assistant_message'] = {
                         'content': content,
                         'output': response_output,
+                        **completion_metadata,
                         **({'usage': usage} if usage else {}),
                     }
                     await outlet_filter_handler(ctx)
@@ -3866,6 +4004,12 @@ async def streaming_chat_response_handler(response, ctx):
             usage = None
             prior_output = []
             last_response_id = None
+            finish_reason = None
+            stream_error = None
+            truncated_tool_call = False
+            auto_continuations = 0
+            auto_continue_enabled, auto_continue_max_retries = auto_continue_config(model)
+            continuation_base_messages = copy.deepcopy(form_data.get('messages', []))
 
             def full_output():
                 return prior_output + output if prior_output else output
@@ -3924,6 +4068,13 @@ async def streaming_chat_response_handler(response, ctx):
                     nonlocal output
                     nonlocal prior_output
                     nonlocal last_response_id
+                    nonlocal finish_reason
+                    nonlocal stream_error
+                    nonlocal truncated_tool_call
+
+                    finish_reason = None
+                    stream_error = None
+                    truncated_tool_call = False
 
                     response_tool_calls = []
 
@@ -4085,6 +4236,7 @@ async def streaming_chat_response_handler(response, ctx):
                                     if not choices:
                                         error = data.get('error', {})
                                         if error:
+                                            stream_error = error
                                             log.error('Provider returned error (streaming): %s', error)
                                             try:
                                                 await Chats.upsert_message_to_chat_by_id_and_message_id(
@@ -4106,7 +4258,10 @@ async def streaming_chat_response_handler(response, ctx):
                                             )
                                         continue
 
-                                    delta = choices[0].get('delta', {})
+                                    choice = choices[0]
+                                    if isinstance(choice.get('finish_reason'), str):
+                                        finish_reason = choice['finish_reason']
+                                    delta = choice.get('delta', {})
 
                                     # Handle delta annotations
                                     annotations = delta.get('annotations')
@@ -4448,7 +4603,15 @@ async def streaming_chat_response_handler(response, ctx):
                         if output[-1].get('type') == 'message':
                             parts = output[-1].get('content', [])
                             if parts and parts[-1].get('type') == 'output_text':
-                                parts[-1]['text'] = parts[-1]['text'].strip()
+                                preserve_continuation_boundary = (
+                                    auto_continue_enabled
+                                    and finish_reason == 'length'
+                                    and not stream_error
+                                    and not response_tool_calls
+                                    and auto_continuations < auto_continue_max_retries
+                                )
+                                if not preserve_continuation_boundary:
+                                    parts[-1]['text'] = parts[-1]['text'].strip()
 
                                 if not parts[-1]['text']:
                                     output.pop()
@@ -4474,7 +4637,10 @@ async def streaming_chat_response_handler(response, ctx):
                                 reasoning_item['status'] = 'completed'
 
                     if response_tool_calls:
-                        tool_calls.append(_split_tool_calls(response_tool_calls))
+                        if finish_reason == 'length':
+                            truncated_tool_call = True
+                        else:
+                            tool_calls.append(_split_tool_calls(response_tool_calls))
 
                     # Responses API path: extract function_call items from output
                     if not response_tool_calls and output:
@@ -4505,11 +4671,75 @@ async def streaming_chat_response_handler(response, ctx):
                         if responses_api_tool_calls:
                             tool_calls.append(_split_tool_calls(responses_api_tool_calls))
 
-                try:
-                    await stream_body_handler(response, form_data)
-                finally:
-                    if response.background:
-                        await response.background()
+                async def consume_stream_with_auto_continue(response, segment_form_data, segment_output_start=0):
+                    nonlocal auto_continuations
+                    nonlocal stream_error
+
+                    while True:
+                        try:
+                            await stream_body_handler(response, segment_form_data)
+                        finally:
+                            if response.background:
+                                await response.background()
+
+                        should_continue = (
+                            auto_continue_enabled
+                            and finish_reason == 'length'
+                            and not stream_error
+                            and not truncated_tool_call
+                            and not tool_calls
+                            and auto_continuations < auto_continue_max_retries
+                        )
+                        if not should_continue:
+                            return
+
+                        messages = continuation_messages(
+                            segment_form_data.get('messages', continuation_base_messages),
+                            output[segment_output_start:],
+                            reasoning_format=get_reasoning_format(model),
+                        )
+                        if not messages or messages[-1].get('role') != 'assistant':
+                            return
+
+                        auto_continuations += 1
+                        await event_emitter(
+                            {
+                                'type': 'chat:completion',
+                                'data': {'auto_continuations': auto_continuations},
+                            }
+                        )
+                        continuation_form_data = {
+                            **segment_form_data,
+                            'model': model_id,
+                            'stream': True,
+                            'metadata': metadata,
+                            'messages': messages,
+                            'continue_final_message': True,
+                            'add_generation_prompt': False,
+                        }
+
+                        try:
+                            next_response = await generate_chat_completion(
+                                request,
+                                continuation_form_data,
+                                user,
+                                bypass_system_prompt=True,
+                            )
+                        except (asyncio.CancelledError, KeyboardInterrupt):
+                            raise
+                        except Exception as exc:
+                            stream_error = str(exc)
+                            log.warning('Automatic response continuation failed: %s', exc)
+                            return
+
+                        if not isinstance(next_response, StreamingResponse):
+                            stream_error = 'The continuation provider returned a non-streaming response.'
+                            return
+
+                        response = next_response
+                        segment_form_data = continuation_form_data
+
+                await consume_stream_with_auto_continue(response, form_data)
 
                 tool_call_iterations = 0
                 tool_call_sources = []  # Track citation sources from tool results
@@ -4901,7 +5131,7 @@ async def streaming_chat_response_handler(response, ctx):
                                 if not msg_parts or (len(msg_parts) == 1 and not msg_parts[0].get('text', '').strip()):
                                     prior_output.pop()
                             output = []
-                            await stream_body_handler(res, new_form_data)
+                            await consume_stream_with_auto_continue(res, new_form_data)
                             output[:0] = prior_output
                             prior_output = []
                         else:
@@ -5094,12 +5324,39 @@ async def streaming_chat_response_handler(response, ctx):
                             )
 
                             if isinstance(res, StreamingResponse):
-                                await stream_body_handler(res, new_form_data)
+                                await consume_stream_with_auto_continue(
+                                    res,
+                                    new_form_data,
+                                    max(len(output) - 1, 0),
+                                )
                             else:
                                 break
                         except Exception as e:
                             log.debug(e)
                             break
+
+                partial = finish_reason == 'length' or truncated_tool_call or bool(stream_error)
+                if truncated_tool_call:
+                    partial_reason = 'tool_call_truncated'
+                elif stream_error:
+                    partial_reason = 'provider_error'
+                elif finish_reason == 'length':
+                    partial_reason = 'output_limit'
+                else:
+                    partial_reason = None
+                completion_metadata = {
+                    'finish_reason': finish_reason,
+                    'auto_continuations': auto_continuations,
+                    'partial': partial,
+                    'partial_reason': partial_reason,
+                }
+                if usage:
+                    usage = {
+                        **usage,
+                        'finish_reason': finish_reason,
+                        'auto_continuations': auto_continuations,
+                        'partial': partial,
+                    }
 
                 # Mark all in-progress items as completed
                 for item in output:
@@ -5116,6 +5373,7 @@ async def streaming_chat_response_handler(response, ctx):
                     'content': serialize_output(output),
                     'output': output,
                     'title': title,
+                    **completion_metadata,
                     **({'usage': usage} if usage else {}),
                 }
 
@@ -5129,6 +5387,7 @@ async def streaming_chat_response_handler(response, ctx):
                                 'done': True,
                                 'content': serialize_output(output),
                                 'output': output,
+                                **completion_metadata,
                                 **({'usage': usage} if usage else {}),
                             },
                         )
@@ -5136,13 +5395,13 @@ async def streaming_chat_response_handler(response, ctx):
                         await Chats.upsert_message_to_chat_by_id_and_message_id(
                             metadata['chat_id'],
                             metadata['message_id'],
-                            {'done': True, 'usage': usage},
+                            {'done': True, 'usage': usage, **completion_metadata},
                         )
                     else:
                         await Chats.upsert_message_to_chat_by_id_and_message_id(
                             metadata['chat_id'],
                             metadata['message_id'],
-                            {'done': True},
+                            {'done': True, **completion_metadata},
                         )
 
                 # Send a webhook notification if the user is not active
@@ -5171,6 +5430,7 @@ async def streaming_chat_response_handler(response, ctx):
                 ctx['assistant_message'] = {
                     'content': serialize_output(output),
                     'output': output,
+                    **completion_metadata,
                     **({'usage': usage} if usage else {}),
                 }
                 await outlet_filter_handler(ctx)

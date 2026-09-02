@@ -27,6 +27,56 @@ from open_webui.utils.plugin import (
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
 
+DYNAMIC_BASE_META_KEYS = ('local_llm', 'auto_continue_max_retries')
+DYNAMIC_BASE_CAPABILITY_KEYS = {
+    'vision',
+    'file_upload',
+    'file_context',
+    'reasoning_effort',
+    'image_generation',
+    'usage',
+    'citations',
+    'status_updates',
+    'auto_continue_on_length',
+}
+
+
+def inherit_base_model_metadata(info: dict, base_model: dict | None) -> dict:
+    """Keep custom model presets aligned with runtime base-model capabilities."""
+    if not base_model:
+        return info
+
+    base_meta = ((base_model.get('info') or {}).get('meta') or {}) if isinstance(base_model, dict) else {}
+    if not isinstance(base_meta, dict):
+        return info
+
+    merged = copy.deepcopy(info)
+    meta = merged.setdefault('meta', {})
+    if not isinstance(meta, dict):
+        meta = {}
+        merged['meta'] = meta
+
+    for key in DYNAMIC_BASE_META_KEYS:
+        if key in base_meta:
+            meta[key] = copy.deepcopy(base_meta[key])
+        else:
+            meta.pop(key, None)
+
+    base_capabilities = base_meta.get('capabilities')
+    if isinstance(base_capabilities, dict):
+        capabilities = meta.setdefault('capabilities', {})
+        if not isinstance(capabilities, dict):
+            capabilities = {}
+            meta['capabilities'] = capabilities
+
+        for key in DYNAMIC_BASE_CAPABILITY_KEYS:
+            if key in base_capabilities:
+                capabilities[key] = copy.deepcopy(base_capabilities[key])
+            else:
+                capabilities.pop(key, None)
+
+    return merged
+
 
 async def fetch_ollama_models(request: Request, user: UserModel = None):
     raw_ollama_models = await ollama.get_all_models(request, user=user)
@@ -199,6 +249,7 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
             if 'params' in info:
                 # Remove params to avoid exposing sensitive info
                 del info['params']
+            info = inherit_base_model_metadata(info, base_model)
 
             model['info'] = info
 

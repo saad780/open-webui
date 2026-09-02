@@ -165,6 +165,7 @@
 	let generating = false;
 	let dragged = false;
 	let generationController = null;
+	let responseUsageStartedAt = new Map<string, number>();
 
 	let chat = null;
 	let tags = [];
@@ -177,6 +178,112 @@
 	};
 
 	let taskIds = null;
+
+	const contentToText = (content) => {
+		if (typeof content === 'string') {
+			return content;
+		}
+		if (Array.isArray(content)) {
+			return content
+				.map((part) => {
+					if (typeof part === 'string') {
+						return part;
+					}
+					if (part?.type === 'text' && typeof part?.text === 'string') {
+						return part.text;
+					}
+					return '';
+				})
+				.join(' ');
+		}
+		return '';
+	};
+
+	const estimateTokenCount = (content) => {
+		const text = removeAllDetails(contentToText(content)).trim();
+		if (!text) {
+			return 0;
+		}
+		return Math.max(1, Math.ceil(text.length / 4));
+	};
+
+	const buildStoppedUsage = (message) => {
+		const endedAt = Date.now();
+		const startedAt =
+			responseUsageStartedAt.get(message.id) ??
+			(message.timestamp ? message.timestamp * 1000 : endedAt);
+		const responseSeconds = Math.max((endedAt - startedAt) / 1000, 0);
+		const parentMessage = message.parentId ? history.messages[message.parentId] : null;
+		const promptTokens = estimateTokenCount(parentMessage?.content ?? '');
+		const completionTokens = estimateTokenCount(message.content ?? '');
+		const hadUsage = Boolean(message.usage);
+		const usage = {
+			...(message.usage ?? {}),
+			stopped: true,
+			partial: true,
+			...(hadUsage ? {} : { estimated: true }),
+			prompt_tokens: message.usage?.prompt_tokens ?? promptTokens,
+			completion_tokens: message.usage?.completion_tokens ?? completionTokens,
+			total_tokens: message.usage?.total_tokens ?? promptTokens + completionTokens,
+			response_seconds: message.usage?.response_seconds ?? Number(responseSeconds.toFixed(3))
+		};
+
+		if (completionTokens > 0 && responseSeconds > 0) {
+			const tokensPerSecond = Number((completionTokens / responseSeconds).toFixed(2));
+			usage.tokens_per_second = message.usage?.tokens_per_second ?? tokensPerSecond;
+			usage.completion_tokens_per_second =
+				message.usage?.completion_tokens_per_second ?? tokensPerSecond;
+			usage.end_to_end_tokens_per_second =
+				message.usage?.end_to_end_tokens_per_second ?? tokensPerSecond;
+		}
+
+		return usage;
+	};
+
+	const ensureStoppedUsage = (message) => {
+		if (!message || message.role !== 'assistant') {
+			return;
+		}
+
+		message.usage = buildStoppedUsage(message);
+		message.info = {
+			...(message.info ?? {}),
+			usage: message.usage
+		};
+		responseUsageStartedAt.delete(message.id);
+	};
+
+	const finalizeStoppedResponseMessages = async () => {
+		const responseMessage = history.currentId ? history.messages[history.currentId] : null;
+		if (!responseMessage || responseMessage.role !== 'assistant') {
+			return;
+		}
+
+		if (responseMessage.parentId && history.messages[responseMessage.parentId]) {
+			for (const messageId of history.messages[responseMessage.parentId].childrenIds) {
+				const message = history.messages[messageId];
+				if (message?.role === 'assistant') {
+					ensureStoppedUsage(message);
+					message.done = true;
+				}
+			}
+		} else {
+			ensureStoppedUsage(responseMessage);
+			responseMessage.done = true;
+		}
+
+		ensureStoppedUsage(responseMessage);
+		responseMessage.done = true;
+		history.messages[responseMessage.id] = responseMessage;
+
+		if ($chatId) {
+			await saveChatHandler($chatId, history);
+		}
+
+		if (autoScroll) {
+			scrollToBottom();
+		}
+	};
 
 	// Chat Input
 	let prompt = '';
@@ -1755,7 +1862,21 @@
 	};
 
 	const chatCompletionEventHandler = async (data, message, chatId) => {
-		const { id, done, choices, content, output, sources, selected_model_id, error, usage } = data;
+		const {
+			id,
+			done,
+			choices,
+			content,
+			output,
+			sources,
+			selected_model_id,
+			error,
+			usage,
+			finish_reason,
+			auto_continuations,
+			partial,
+			partial_reason
+		} = data;
 
 		// Store raw OR-aligned output items from backend
 		if (output) {
@@ -1855,12 +1976,30 @@
 
 		if (usage) {
 			message.usage = usage;
+			message.info = {
+				...(message.info ?? {}),
+				usage: message.usage
+			};
+		}
+
+		if (finish_reason !== undefined) {
+			message.finish_reason = finish_reason;
+		}
+		if (auto_continuations !== undefined) {
+			message.auto_continuations = auto_continuations;
+		}
+		if (partial !== undefined) {
+			message.partial = partial;
+		}
+		if (partial_reason !== undefined) {
+			message.partial_reason = partial_reason;
 		}
 
 		history.messages[message.id] = message;
 
 		if (done) {
 			message.done = true;
+			responseUsageStartedAt.delete(message.id);
 
 			if ($settings.responseAutoCopy) {
 				copyToClipboard(message.content);
@@ -2118,6 +2257,7 @@
 					modelIdx: modelIdx ? modelIdx : _modelIdx,
 					timestamp: Math.floor(Date.now() / 1000) // Unix epoch
 				};
+				responseUsageStartedAt.set(responseMessageId, Date.now());
 
 				// Add message to history and Set currentId to messageId
 				history.messages[responseMessageId] = responseMessage;
@@ -2273,6 +2413,9 @@
 		} = {}
 	) => {
 		const responseMessage = _history.messages[responseMessageId];
+		if (!responseUsageStartedAt.has(responseMessageId)) {
+			responseUsageStartedAt.set(responseMessageId, Date.now());
+		}
 		const userMessage = _history.messages[responseMessage.parentId];
 
 		const chatMessageFiles = _messages
@@ -2607,6 +2750,7 @@
 	};
 
 	const stopResponse = async (processQueue = true) => {
+		let stoppedGeneration = false;
 		if (taskIds) {
 			if ($chatId) {
 				await stopTasksByChatId(localStorage.token, $chatId).catch((error) => {
@@ -2623,26 +2767,18 @@
 			}
 
 			taskIds = null;
-
-			const responseMessage = history.messages[history.currentId];
-			// Set all response messages to done
-			if (responseMessage.parentId && history.messages[responseMessage.parentId]) {
-				for (const messageId of history.messages[responseMessage.parentId].childrenIds) {
-					history.messages[messageId].done = true;
-				}
-			}
-
-			history.messages[history.currentId] = responseMessage;
-
-			if (autoScroll) {
-				scrollToBottom();
-			}
+			stoppedGeneration = true;
 		}
 
 		if (generating) {
 			generating = false;
 			generationController?.abort();
 			generationController = null;
+			stoppedGeneration = true;
+		}
+
+		if (stoppedGeneration) {
+			await finalizeStoppedResponseMessages();
 		}
 
 		if (processQueue) {
@@ -3134,6 +3270,7 @@
 									{selectedModels}
 									bind:files
 									bind:prompt
+									bind:params
 									bind:autoScroll
 									bind:selectedToolIds
 									bind:selectedSkillIds
@@ -3216,6 +3353,7 @@
 									bind:messageInput
 									bind:files
 									bind:prompt
+									bind:params
 									bind:autoScroll
 									bind:selectedToolIds
 									bind:selectedSkillIds

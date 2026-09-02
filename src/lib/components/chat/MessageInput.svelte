@@ -90,6 +90,7 @@
 	import Voice from '../icons/Voice.svelte';
 	import Terminal from '../icons/Terminal.svelte';
 	import IntegrationsMenu from './MessageInput/IntegrationsMenu.svelte';
+	import ThinkingEffortMenu from './MessageInput/ThinkingEffortMenu.svelte';
 	import TerminalMenu from './MessageInput/TerminalMenu.svelte';
 	import Component from '../icons/Component.svelte';
 	import PlusAlt from '../icons/PlusAlt.svelte';
@@ -133,6 +134,7 @@
 
 	export let prompt = '';
 	export let files = [];
+	export let params: Record<string, unknown> = {};
 
 	export let selectedToolIds = [];
 	export let selectedSkillIds = [];
@@ -1724,6 +1726,13 @@
 											</button>
 										</IntegrationsMenu>
 									{/if}
+
+									<ThinkingEffortMenu
+										models={selectedModelIds
+											.map((id) => $models.find((model) => model.id === id))
+											.filter((model): model is Model => Boolean(model))}
+										bind:params
+									/>
 
 									{#if selectedModelIds.length === 1 && $models.find((m) => m.id === selectedModelIds[0])?.has_user_valves}
 										<div class="ml-1 flex gap-1.5">
