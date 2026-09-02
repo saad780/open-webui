@@ -112,6 +112,7 @@ from open_webui.utils.payload import apply_system_prompt_to_body
 from open_webui.utils.plugin import load_function_module_by_id
 from open_webui.utils.response import normalize_usage
 from open_webui.utils.sanitize import sanitize_code
+from open_webui.utils.skill_selection import resolve_skill_ids
 from open_webui.utils.task import (
     get_task_model_id,
     rag_template,
@@ -2669,11 +2670,14 @@ async def process_chat_payload(request, form_data, user, metadata, model):
 
     # Skills — extract IDs from message content (<$skillId|label> tags) so
     # persisted chats work without relying on the frontend to send skill_ids.
-    user_skill_ids = set(form_data.pop('skill_ids', None) or [])
-    user_skill_ids |= extract_skill_ids_from_messages(form_data.get('messages', []))
+    submitted_skill_ids = set(form_data.pop('skill_ids', None) or [])
+    mentioned_skill_ids = extract_skill_ids_from_messages(form_data.get('messages', []))
     model_skill_ids = set(model.get('info', {}).get('meta', {}).get('skillIds', []))
-
-    all_skill_ids = user_skill_ids | model_skill_ids
+    user_skill_ids, all_skill_ids = resolve_skill_ids(
+        submitted_skill_ids,
+        model_skill_ids,
+        mentioned_skill_ids,
+    )
     available_skills = []
     if all_skill_ids:
         from open_webui.models.skills import Skills as SkillsModel
